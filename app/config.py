@@ -8,7 +8,12 @@ top_k или порог отказа — правится один файл. З�
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).resolve().parent.parent
+
+# Подхватываем .env (ключи LLM, переопределения моделей). Без файла — no-op.
+load_dotenv(ROOT / ".env")
 
 # --- Пути к данным и артефактам ---
 DATA_RAW = ROOT / "data" / "raw"
@@ -51,7 +56,9 @@ RERANK_CANDIDATES = int(os.getenv("RAG_RERANK_CANDIDATES", "20"))  # сколь�
 
 # Порог релевантности после reranking/фьюжна: ниже — считаем, что контекста нет.
 # Для cross-encoder (логиты) и для RRF-score пороги разные — храним оба.
-MIN_RERANK_SCORE = float(os.getenv("RAG_MIN_RERANK_SCORE", "0.1"))
+# Реранкер даёт чистый разрыв: релевантные пары ~0.08–0.95, нерелевантные <0.01.
+# Порог 0.05 лежит в этом зазоре: пропускает релевантное, отсекает мусор (→ отказ).
+MIN_RERANK_SCORE = float(os.getenv("RAG_MIN_RERANK_SCORE", "0.05"))
 MIN_FUSION_SCORE = float(os.getenv("RAG_MIN_FUSION_SCORE", "0.01"))
 
 # --- LLM (генерация) ---
