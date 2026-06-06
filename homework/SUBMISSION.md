@@ -2,7 +2,7 @@
 
 ## Ссылка на репозиторий с заданием
 
-- Repo URL: `<вставьте ссылку на ваш форк, например https://github.com/<user>/rag-tutorial>`
+- Repo URL: `https://github.com/KonstantinPatrushev/rag-tutorial`
 - Ветка: `patrushev_konstantin_hw`
 
 ## Автор
