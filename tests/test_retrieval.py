@@ -1,96 +1,66 @@
-"""Тесты retrieval и demo-ответа."""
+"""Тесты hybrid retrieval на маленьком реальном индексе.
 
-import json
-import pickle
-from pathlib import Path
+Строит крошечный гибридный индекс (4 чанка) настоящим эмбеддером + BM25 и
+проверяет сквозной поиск. Модель e5-small кэшируется после первой загрузки,
+поэтому тест выполняется быстро. Reranker отключён — отдельная тяжёлая модель.
+"""
 
 import pytest
-import scipy.sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
 
-from app.config import TOP_K
-from app.generator import ask
-from app.prompts import REFUSAL_NO_CONTEXT
+from app.embedder import embed_passages
+from app.index import HybridIndex, build_bm25, build_faiss
 from app.retriever import Retriever
 
-
-@pytest.fixture
-def mini_index(tmp_path: Path) -> dict[str, Path]:
-    """Мини-индекс из двух чанков для изолированных тестов."""
-    chunks = [
-        {
-            "chunk_id": "2_0",
-            "doc_id": "2",
-            "name": "Ипотека — закрытие ипотечной сделки (Citibank)",
-            "text": "Продукт: ипотека. Проблема: закрытие ипотечной сделки. Citibank ставка.",
-        },
-        {
-            "chunk_id": "1_0",
-            "doc_id": "1",
-            "name": "Студенческий кредит",
-            "text": "Продукт: студенческий кредит. Трудности с погашением займа.",
-        },
-    ]
-    chunks_path = tmp_path / "chunks.jsonl"
-    with chunks_path.open("w", encoding="utf-8") as f:
-        for chunk in chunks:
-            f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
-
-    texts = [c["text"] for c in chunks]
-    vectorizer = TfidfVectorizer()
-    matrix = vectorizer.fit_transform(texts)
-
-    vectorizer_path = tmp_path / "vectorizer.pkl"
-    matrix_path = tmp_path / "matrix.npz"
-    with vectorizer_path.open("wb") as f:
-        pickle.dump(vectorizer, f)
-    scipy.sparse.save_npz(matrix_path, matrix)
-
-    return {
-        "vectorizer_path": vectorizer_path,
-        "matrix_path": matrix_path,
-        "chunks_path": chunks_path,
-    }
+CHUNKS = [
+    {"chunk_id": "0_0", "doc_id": "0", "name": "Байконур",
+     "text": "Россия арендует у Казахстана космодром Байконур для космических запусков."},
+    {"chunk_id": "1_0", "doc_id": "1", "name": "Белки",
+     "text": "Белки — высокомолекулярные органические вещества из аминокислот."},
+    {"chunk_id": "2_0", "doc_id": "2", "name": "Инфляция",
+     "text": "Инфляция — это устойчивый рост общего уровня цен в экономике."},
+    {"chunk_id": "3_0", "doc_id": "3", "name": "Водоросли",
+     "text": "Органические остатки представлены известковыми выделениями водорослей."},
+]
 
 
-def test_search_returns_k_results(mini_index):
-    r = Retriever(**mini_index)
-    results = r.search("ипотека Citibank", k=2)
+@pytest.fixture(scope="module")
+def retriever() -> Retriever:
+    texts = [c["text"] for c in CHUNKS]
+    embeddings = embed_passages(texts)
+    index = HybridIndex(
+        chunks=CHUNKS,
+        faiss_index=build_faiss(embeddings),
+        bm25=build_bm25(texts),
+        embed_model="intfloat/multilingual-e5-small",
+    )
+    return Retriever(index=index, use_reranker=False)
+
+
+def test_returns_k_results(retriever):
+    results = retriever.search("что арендует Россия в Казахстане?", k=2)
     assert len(results) == 2
 
 
-def test_search_results_have_doc_id_and_score(mini_index):
-    r = Retriever(**mini_index)
-    results = r.search("ипотека", k=TOP_K)
+def test_results_have_required_fields(retriever):
+    results = retriever.search("из чего состоят белки?", k=3)
     assert results
     for hit in results:
-        assert "doc_id" in hit
-        assert "text" in hit
-        assert "score" in hit
-        assert "name" in hit
+        for field in ("doc_id", "text", "name", "score", "fusion_score", "score_kind"):
+            assert field in hit
         assert isinstance(hit["score"], float)
 
 
-def test_search_ipoteka_prefers_mortgage_doc(mini_index):
-    r = Retriever(**mini_index)
-    results = r.search("ипотека Citibank ставка", k=1)
+def test_semantic_match_finds_right_doc(retriever):
+    # запрос-перефразировка без точных слов из текста -> проверяем semantic-составляющую
+    results = retriever.search("аренда космодрома у соседнего государства", k=1)
+    assert results[0]["doc_id"] == "0"
+
+
+def test_lexical_match_finds_right_doc(retriever):
+    results = retriever.search("инфляция рост цен", k=1)
     assert results[0]["doc_id"] == "2"
-    assert results[0]["score"] > 0
 
 
-def test_search_empty_query_returns_empty(mini_index):
-    r = Retriever(**mini_index)
-    assert r.search("") == []
-    assert r.search("   ") == []
-
-
-def test_ask_sources_contain_doc_id(mini_index):
-    result = ask("ипотека Citibank", retriever=Retriever(**mini_index))
-    assert result["sources"]
-    assert all("doc_id" in src for src in result["sources"])
-    assert result["sources"][0]["doc_id"] == "2"
-
-
-def test_ask_refuses_without_relevant_context(mini_index):
-    result = ask("Как приготовить борщ?", retriever=Retriever(**mini_index))
-    assert result["answer"] == REFUSAL_NO_CONTEXT
+def test_empty_query_returns_empty(retriever):
+    assert retriever.search("") == []
+    assert retriever.search("   ") == []

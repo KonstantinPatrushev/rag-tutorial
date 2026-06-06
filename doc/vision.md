@@ -1,48 +1,61 @@
 # Vision — техническое видение проекта
 
-> Отправная точка для разработки.  
+> Отправная точка для разработки.
 > Идея продукта: [00_project_idea.md](00_project_idea.md)
 
-**Учебный RAG** на описаниях экономических датасетов Kaggle: локально, просто, с ответом и источниками.
+**Учебный, но современный (SOTA) RAG** по русскоязычному корпусу Википедии
+(датасет SberQuAD): hybrid retrieval + reranking + LLM-генерация с цитатами и
+честным отказом. Локально, прозрачно, с измеримым качеством.
 
 ---
 
 ## 1. Технологии
 
-Минимальный стек — только то, без чего MVP не работает.
-
 | Слой | Выбор | Комментарий |
 |------|-------|-------------|
 | Язык | **Python 3.10+** | — |
-| Окружение | **uv** + `.venv` | venv через uv; локально, не коммитим |
-| UI | **Streamlit** | Один entry point, видны чанки, scores и источники |
-| Поиск | **TF-IDF + cosine similarity** (`scikit-learn`) | Без torch и тяжёлых моделей; ищет по совпадению слов, не по «смыслу» |
-| Индекс | **Локальные файлы** (`data/index/`) | `vectorizer.pkl` + `matrix.npz` + `chunks.jsonl` — без ChromaDB и без сервера |
-| LLM | **Только demo-режим** | Ответ из найденных чанков по правилам system prompt; внешний API не используем |
-| Данные | **Отобранные датасеты Kaggle** → `data/raw/datasets.json` | Реальные описания и поля с Kaggle; в RAG идёт текст, не CSV |
-| Тесты | **pytest** | 3–5 тестов: chunking, retrieval, источники |
-| Зависимости | **`pyproject.toml`** + uv | `uv sync`; без pip/poetry/conda |
+| Окружение | **uv** + `.venv` | `uv sync`; локально, не коммитим |
+| UI | **Streamlit** | Один entry point; видны этапы retrieval, score, источники |
+| Данные | **HuggingFace SberQuAD** → `data/raw/datasets.json` | Абзацы рус. Википедии + golden-set вопрос→контекст |
+| Чанкинг | **Token-aware рекурсивный** (`app/chunker.py`) | по предложениям, лимит в токенах + overlap |
+| Эмбеддинги | **sentence-transformers** `multilingual-e5-small` | плотный semantic-поиск, мультиязычный |
+| Lexical-поиск | **BM25** (`rank-bm25`) | точные слова, термины, имена, числа |
+| Индекс | **FAISS** (dense, IndexFlatIP) + **BM25** + `chunks.jsonl` | локальные файлы в `data/index/` |
+| Fusion | **Reciprocal Rank Fusion (RRF)** | объединяет dense и lexical по рангам |
+| Reranking | **cross-encoder** `DiTy/cross-encoder-russian-msmarco` | retrieve-then-rerank, опционально |
+| LLM | **OpenAI-совместимый API** + extractive-fallback | grounded-ответ с цитатами `[n]`; без ключа — офлайн-режим |
+| Оценка | **recall@k, hit@k, MRR** на golden-set | `scripts/evaluate.py` |
+| Тесты | **pytest** | chunking, RRF, hybrid retrieval, generation, метрики |
 
-### Данные с Kaggle (как устроено)
+### Почему так (SOTA-обоснование)
 
-1. Выбираем **5–10 экономических датасетов** на Kaggle (безработица, инфляция, ВВП и т.п.).
-2. Берём **описание и список полей** — с страницы датасета или из README.
-3. Сохраняем в `datasets.json` (ручной экспорт, без Kaggle API).
-4. CSV **не индексируем** — только текст для RAG.
+- **Hybrid (dense + BM25)** сильнее любого одиночного ретривера: dense ловит
+  смысл и перефразировки, BM25 — редкие термины/имена/числа.
+- **RRF** объединяет ранжирования без подбора весов и не зависит от шкалы score.
+- **Cross-encoder reranking** — классический паттерн «retrieve-then-rerank»:
+  дёшево достаём кандидатов, дорого и точно пересортировываем только топ.
+- **Grounded-генерация с цитатами** и **порогом отказа** — ответ привязан к
+  источникам, выдумывание исключается.
+- **Offline-fallback** гарантирует запуск на чистой машине без секретов.
 
-### Ограничение TF-IDF (осознанно)
+### Воспроизводимость
 
-Поиск по ключевым словам: синонимы и перефразировки могут не находиться. Для учебного MVP это приемлемо — pipeline тот же, что и с embeddings.
+- `datasets.json` и `eval.json` **коммитятся** → проверяющему не нужен интернет
+  для сборки индекса (модели качаются с HuggingFace при первом запуске).
+- Артефакты индекса (`data/index/`) и промежуточные `*.jsonl` — **не коммитятся**,
+  пересобираются командой `build_index.py`.
 
-### Не используем в MVP
-
-ChromaDB, sentence-transformers, torch, LangChain / LlamaIndex, FastAPI, Docker, reranking, hybrid search, OpenAI, Kaggle API, pandas для анализа CSV, pip/poetry/conda (используем **uv**).
-
-### Окружение (как запускать)
+### Окружение
 
 ```bash
-uv venv          # создать .venv
-uv sync          # установить зависимости из pyproject.toml
+uv venv
+uv sync
 ```
 
 ---
+
+## 2. Границы
+
+- Корпус — отобранные абзацы SberQuAD (по умолчанию 2000 → ~2000+ чанков).
+- LLM-провайдер не зашит: любой OpenAI-совместимый endpoint через `.env`.
+- Не строим распределённую/прод-инфраструктуру: один процесс, локальные файлы.

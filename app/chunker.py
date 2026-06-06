@@ -1,75 +1,105 @@
-"""Chunking: documents.jsonl → chunks.jsonl."""
+"""Chunking: documents.jsonl → chunks.jsonl.
+
+Token-aware рекурсивная нарезка: текст → предложения → жадная упаковка в чанки
+с целевым лимитом токенов и перекрытием (overlap). Перекрытие сохраняет контекст
+на границах чанков, что улучшает retrieval. Счёт токенов — детерминированный
+лёгкий токенайзер (без загрузки нейромодели), поэтому chunking быстрый и
+тестируется офлайн.
+"""
 
 import json
+import re
 from pathlib import Path
 
-from app.config import CHUNK_MAX_CHARS, CHUNK_OVERLAP, DOCUMENTS_JSONL, CHUNKS_JSONL
+from app.config import CHUNK_MAX_TOKENS, CHUNK_OVERLAP_TOKENS, CHUNKS_JSONL, DOCUMENTS_JSONL
+
+# Слова, числа и одиночная пунктуация — близко к тому, как текст видит subword-токенайзер.
+_TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+# Конец предложения: . ! ? … с последующим пробелом, либо перенос строки.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|\n+")
 
 
-def split_paragraphs(text: str) -> list[str]:
-    """Разбивает текст на непустые абзацы."""
-    return [p.strip() for p in text.split("\n\n") if p.strip()]
+def count_tokens(text: str) -> int:
+    """Приблизительное число токенов (детерминированно, без модели)."""
+    return len(_TOKEN_RE.findall(text))
 
 
-def split_long_text(text: str, max_chars: int) -> list[str]:
-    """Длинный абзац без переносов — жёсткая нарезка; overlap добавляется позже."""
-    if len(text) <= max_chars:
-        return [text]
-    parts: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(start + max_chars, len(text))
-        parts.append(text[start:end])
-        start = end
+def split_sentences(text: str) -> list[str]:
+    """Грубая, но устойчивая разбивка на предложения."""
+    parts = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
     return parts
 
 
-def apply_overlap(chunks: list[str], overlap: int, max_chars: int) -> list[str]:
-    """Добавляет overlap из предыдущего чанка в начало следующего."""
-    if overlap <= 0 or len(chunks) <= 1:
-        return chunks
-    result = [chunks[0]]
-    for i in range(1, len(chunks)):
-        prefix = chunks[i - 1][-overlap:]
-        combined = prefix + chunks[i]
-        if len(combined) > max_chars:
-            combined = prefix + chunks[i][: max_chars - len(prefix)]
-        result.append(combined)
-    return result
+def _split_long_sentence(sentence: str, max_tokens: int) -> list[str]:
+    """Предложение длиннее лимита — режем по словам."""
+    words = sentence.split()
+    pieces: list[str] = []
+    current: list[str] = []
+    for word in words:
+        current.append(word)
+        if count_tokens(" ".join(current)) >= max_tokens:
+            pieces.append(" ".join(current))
+            current = []
+    if current:
+        pieces.append(" ".join(current))
+    return pieces
 
 
 def chunk_text(
     text: str,
-    max_chars: int = CHUNK_MAX_CHARS,
-    overlap: int = CHUNK_OVERLAP,
+    max_tokens: int = CHUNK_MAX_TOKENS,
+    overlap_tokens: int = CHUNK_OVERLAP_TOKENS,
 ) -> list[str]:
-    """Нарезка по абзацам с ограничением длины и overlap между чанками."""
+    """Нарезка текста на чанки с целевым размером в токенах и overlap.
+
+    Жадно упаковываем предложения в чанк, пока не превысим max_tokens.
+    Перекрытие реализуется переносом хвостовых предложений предыдущего чанка
+    в начало следующего (по границам предложений, без разрыва слов).
+    """
     if not text.strip():
         return []
 
-    raw_chunks: list[str] = []
-    current_parts: list[str] = []
+    # Готовим плоский список «единиц» — предложений, длинные дробим по словам.
+    units: list[str] = []
+    for sent in split_sentences(text):
+        if count_tokens(sent) <= max_tokens:
+            units.append(sent)
+        else:
+            units.extend(_split_long_sentence(sent, max_tokens))
 
-    def flush() -> None:
-        if current_parts:
-            raw_chunks.append("\n\n".join(current_parts))
-            current_parts.clear()
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
 
-    for para in split_paragraphs(text):
-        for piece in split_long_text(para, max_chars):
-            candidate_parts = current_parts + [piece]
-            candidate = "\n\n".join(candidate_parts)
-            if len(candidate) <= max_chars:
-                current_parts = candidate_parts
-            else:
-                flush()
-                if len(piece) <= max_chars:
-                    current_parts = [piece]
-                else:
-                    raw_chunks.extend(split_long_text(piece, max_chars))
+    def flush() -> list[str]:
+        """Закрывает текущий чанк, возвращает хвост для overlap следующего.
 
-    flush()
-    return apply_overlap(raw_chunks, overlap, max_chars)
+        Overlap берём по словам и ограничиваем overlap_tokens, чтобы перенос
+        не раздувал следующий чанк (даже если последнее предложение длинное).
+        """
+        if not current:
+            return []
+        chunk = " ".join(current)
+        chunks.append(chunk)
+        if overlap_tokens <= 0:
+            return []
+        words = chunk.split()
+        tail_words = words[-overlap_tokens:]
+        return [" ".join(tail_words)] if tail_words else []
+
+    for unit in units:
+        unit_tokens = count_tokens(unit)
+        if current and current_tokens + unit_tokens > max_tokens:
+            tail = flush()
+            current = list(tail)
+            current_tokens = sum(count_tokens(u) for u in current)
+        current.append(unit)
+        current_tokens += unit_tokens
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks
 
 
 def chunk_document(doc: dict) -> list[dict]:
@@ -87,14 +117,18 @@ def chunk_document(doc: dict) -> list[dict]:
     return chunks
 
 
-def load_documents(path: Path) -> list[dict]:
-    documents = []
+def load_jsonl(path: Path) -> list[dict]:
+    items = []
     with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                documents.append(json.loads(line))
-    return documents
+                items.append(json.loads(line))
+    return items
+
+
+# Обратная совместимость с прежним именем (используется в retriever/тестах).
+load_documents = load_jsonl
 
 
 def write_chunks(chunks: list[dict], path: Path) -> None:
@@ -111,7 +145,7 @@ def run(
     if not input_path.exists():
         raise FileNotFoundError(f"Не найден файл: {input_path}")
 
-    documents = load_documents(input_path)
+    documents = load_jsonl(input_path)
     all_chunks: list[dict] = []
     for doc in documents:
         all_chunks.extend(chunk_document(doc))

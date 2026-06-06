@@ -1,47 +1,44 @@
 # Данные и назначение репозитория
 
-Документ описывает, **какие данные** использует учебный RAG, **откуда** они взяты и **что именно** попадает в индекс.
+Документ описывает, **какие данные** использует RAG, **откуда** они, **что**
+попадает в индекс и как устроен **golden-set** для оценки.
 
 ---
 
 ## Назначение репозитория
 
-**Для кого:** студенты и начинающие разработчики, которые учатся строить RAG с нуля.
+**Для кого:** студенты и разработчики, изучающие современный RAG.
 
 **Что демонстрирует:**
 
-- полный offline-pipeline: сырые данные → документы → чанки → TF-IDF индекс → поиск → demo-ответ;
-- ответ **только по найденным фрагментам** с указанием источника (`doc_id`, score);
+- полный pipeline: сырые данные → документы → чанки → эмбеддинги + BM25 →
+  hybrid retrieval → RRF → cross-encoder reranking → ответ с источниками;
+- ответ **только по найденным фрагментам** с цитатами `[n]` и указанием
+  `doc_id` / score каждого этапа;
 - явный **отказ**, если релевантного контекста нет;
-- Streamlit UI для интерактивной проверки.
-
-**Границы MVP:**
-
-- поиск по **слова**м (TF-IDF), не embeddings и не LLM;
-- demo-режим без внешних API;
-- небольшой локальный корпус (9 документов, ~29 чанков);
-- не production-система, а **учебный шаблон** для повторения на своих данных.
-
-Идея продукта изначально — описания **экономических датасетов Kaggle** (см. [00_project_idea.md](00_project_idea.md)).  
-В текущем MVP в качестве демо-корпуса используются **русскоязычные тексты жалоб CFPB** — структура pipeline та же, данные проще получить и воспроизвести локально.
+- **измеримое качество** retrieval на golden-set (recall@k, hit@k, MRR);
+- Streamlit UI с прозрачными этапами поиска.
 
 ---
 
-## Источники данных
+## Источник данных
 
-| Источник | Файл в проекте | Комментарий |
-|----------|----------------|-------------|
-| [CFPB Consumer Complaint Database](https://www.consumerfinance.gov/data-research/consumer-complaints/) | `data/raw/rows.csv` | Скачивается локально (Kaggle или официальный архив CFPB). **Не коммитится** — см. `.gitignore`. |
-| Подготовленный корпус | `data/raw/datasets.json` | 9 записей: `id`, `name`, `text` (на русском). **Коммитится** — готовый демо-набор. |
-| Скрипт подготовки | `scripts/prepare_datasets.py` | Выборка из `rows.csv` + ручные переводы в `TRANSLATIONS`. |
+| Источник | Где | Комментарий |
+|----------|-----|-------------|
+| [SberQuAD](https://huggingface.co/datasets/kuznetsoffandrey/sberquad) (`kuznetsoffandrey/sberquad`, config `sberquad`) | HuggingFace `datasets` | Русскоязычный QA на абзацах Википедии: `context`, `question`, `answers` |
+| Подготовленный корпус | `data/raw/datasets.json` | 2000 уникальных контекстов: `id`, `name`, `text`. **Коммитится** |
+| Golden-set | `data/raw/eval.json` | 200 вопросов: `question`, `answer`, `gold_doc_id`. **Коммитится** |
+| Скрипт подготовки | `scripts/prepare_datasets.py` | Выгрузка из SberQuAD, дедуп контекстов, сборка golden-set |
 
-**Kaggle:** [Consumer Complaint Database (CFPB)](https://www.kaggle.com/datasets/datasnaek/consumer-complaint-database) — типичная точка входа для скачивания `rows.csv`.
+**Масштаб:** 2000 документов → **~2000+ чанков** после нарезки (> требования
+«1000+ записей или 1000+ чанков»). Размер корпуса настраивается (`N_CONTEXTS`).
 
-**Лицензия:** данные CFPB — открытые данные правительства США (public domain / open government data).  
-Уточняйте актуальные условия на [consumerfinance.gov](https://www.consumerfinance.gov/data-research/consumer-complaints/) и на странице датасета Kaggle при скачивании.
+**Лицензия:** SberQuAD распространяется на HuggingFace; исходные тексты —
+из русской Википедии (CC BY-SA). Уточняйте условия на странице датасета.
 
-**Дата выгрузки / подготовки:** подготовлено для учебного репозитория, **май 2026**.  
-При пересборке `datasets.json` из свежего `rows.csv` дата и состав записей могут отличаться.
+**Воспроизводимость:** `datasets.json` и `eval.json` закоммичены, поэтому
+для сборки индекса интернет **не нужен** — скачиваются только модели
+(эмбеддер/reranker) при первом запуске.
 
 ---
 
@@ -49,19 +46,33 @@
 
 | Поле / артефакт | Индексируется? | Где используется |
 |-----------------|:--------------:|------------------|
-| `text` из `datasets.json` | **Да** | TF-IDF матрица, поиск, demo-ответ |
+| `text` (контекст) | **Да** | чанки → эмбеддинги (FAISS) + BM25 |
 | `name` | Нет (метаданные) | UI, источники — подпись документа |
-| `doc_id` | Нет (метаданные) | UI, источники — идентификатор записи |
-| `source_file` | Нет | `documents.jsonl`, трассировка происхождения |
+| `doc_id` | Нет (метаданные) | UI, источники, метрики (сопоставление с gold) |
+| `eval.json` | Нет | только оценка качества retrieval |
 
 **Pipeline:**
 
 ```
-datasets.json → documents.jsonl → chunks.jsonl → vectorizer.pkl + matrix.npz
+datasets.json → documents.jsonl → chunks.jsonl → embeddings.npy + faiss.index + bm25.pkl
 ```
 
-- **Чанки:** нарезка по абзацам, max 400 символов, overlap 50 (`app/chunker.py`).
-- **Поиск:** cosine similarity по TF-IDF векторам (`app/retriever.py`).
+- **Чанки:** token-aware по предложениям, ~220 токенов, overlap ~40 (`app/chunker.py`).
+- **Поиск:** dense (cosine по e5) + BM25 → RRF → cross-encoder rerank (`app/retriever.py`).
+
+---
+
+## Golden-set и метрики
+
+SberQuAD даёт пары **вопрос → правильный контекст**. При подготовке для каждого
+вопроса сохраняется `gold_doc_id` — id документа с правильным ответом. Это
+позволяет честно мерить retrieval:
+
+- **hit@k / recall@k** — попал ли правильный документ в top-k;
+- **MRR** — средний обратный ранг правильного документа.
+
+Запуск: `uv run python scripts/evaluate.py` (сравнивает hybrid+RRF и
+hybrid+RRF+reranker). Метрики — в [README](../README.md).
 
 ---
 
@@ -69,48 +80,24 @@ datasets.json → documents.jsonl → chunks.jsonl → vectorizer.pkl + matrix.n
 
 | Не индексируется | Причина |
 |------------------|---------|
-| `data/raw/rows.csv` | Сырой CSV CFPB — только для локальной подготовки `datasets.json` |
-| CSV-файлы Kaggle | MVP работает с текстом описаний, не с табличным анализом |
-| Kaggle API | Не используется в runtime |
-| Секреты, API-ключи | Demo-режим без внешних LLM |
-| `data/processed/*.jsonl` | Промежуточные артефакты, генерируются скриптами |
-| `data/index/*` | Индекс пересобирается командой `build_index.py` |
-
----
-
-## Состав демо-корпуса
-
-9 документов (`doc_id` 0…8), темы — финансовые жалобы потребителей (CFPB):
-
-| doc_id | Тема (кратко) |
-|--------|----------------|
-| 0 | Взыскание долга |
-| 1 | Студенческий кредит |
-| 2 | Ипотека (Citibank) |
-| 3 | Кредитная / предоплаченная карта |
-| 4 | Расчётный счёт (Wells Fargo) |
-| 5 | Денежный перевод (Xoom) |
-| 6 | Краткосрочный займ |
-| 7 | Кредитная карта (Capital One) |
-| 8 | Банковский счёт (U.S. Bank) |
-
-**Рабочий demo-запрос в UI:** «Ипотека - закрытие ипотечной сделки» → `doc_id=2`.
-
-**Запросы про безработицу / инфляцию** дают отказ — таких тем в корпусе нет (это ожидаемое поведение для negative-case).
+| `eval.json` | Только для оценки, не часть корпуса |
+| `data/processed/*.jsonl` | Промежуточные артефакты, генерируются |
+| `data/index/*` | Индекс пересобирается `build_index.py` |
+| Секреты / API-ключи | Только через `.env` (не в репозитории) |
 
 ---
 
 ## Как обновить данные
 
-1. Скачать `rows.csv` с Kaggle / CFPB локально в `data/raw/`.
-2. При необходимости обновить переводы в `scripts/prepare_datasets.py`.
-3. Запустить: `uv run python scripts/prepare_datasets.py`
-4. Пересобрать индекс: `uv run python scripts/build_index.py`
+1. (Опционально) поменять `N_CONTEXTS` / `N_EVAL` в `scripts/prepare_datasets.py`.
+2. `uv run python scripts/prepare_datasets.py` — пересобрать корпус и golden-set.
+3. `uv run python scripts/build_index.py` — пересобрать индекс.
+4. `uv run python scripts/evaluate.py` — перепроверить метрики.
 
 ---
 
 ## Связанные документы
 
-- [00_project_idea.md](00_project_idea.md) — идея и целевые данные Kaggle
-- [vision.md](vision.md) — стек и границы MVP
+- [00_project_idea.md](00_project_idea.md) — идея и данные
+- [vision.md](vision.md) — стек и обоснование SOTA-решений
 - [tasklist.md](tasklist.md) — итерационный план

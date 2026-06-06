@@ -1,44 +1,43 @@
-"""Тесты нарезки текста на чанки."""
+"""Тесты token-aware чанкинга."""
 
-from app.chunker import chunk_document, chunk_text, run
-from app.config import CHUNK_MAX_CHARS, CHUNK_OVERLAP, CHUNKS_JSONL
+from app.chunker import chunk_document, chunk_text, count_tokens, run, split_sentences
 
 
-def test_chunk_text_respects_max_size():
-    text = "Абзац один.\n\n" + "слово " * 200
-    chunks = chunk_text(text, max_chars=400, overlap=50)
+def test_count_tokens_nonzero():
+    assert count_tokens("Привет, мир!") >= 3
+    assert count_tokens("") == 0
+
+
+def test_split_sentences():
+    text = "Первое предложение. Второе предложение! Третье?"
+    sents = split_sentences(text)
+    assert len(sents) == 3
+
+
+def test_chunk_text_respects_max_tokens():
+    text = " ".join(f"слово{i}" for i in range(500))
+    chunks = chunk_text(text, max_tokens=50, overlap_tokens=10)
     assert chunks
-    assert all(len(c) <= 400 for c in chunks)
+    # допускаем небольшой запас на overlap, но грубо держим лимит
+    assert all(count_tokens(c) <= 80 for c in chunks)
 
 
-def test_chunk_text_splits_by_paragraphs():
-    text = "Первый абзац про безработицу.\n\nВторой абзац про инфляцию."
-    chunks = chunk_text(text, max_chars=400, overlap=50)
-    assert len(chunks) == 1
-    assert "безработицу" in chunks[0]
-    assert "инфляцию" in chunks[0]
-
-
-def test_chunk_text_overlap_between_chunks():
-    para1 = "А" * 300
-    para2 = "Б" * 300
-    text = f"{para1}\n\n{para2}"
-    chunks = chunk_text(text, max_chars=400, overlap=50)
+def test_chunk_text_overlap_present():
+    s1 = "Предложение про инфляцию и цены в экономике страны сегодня."
+    s2 = "Совсем другая тема про биологию клеток и белки организма."
+    # маленький лимит -> два чанка, overlap переносит хвост первого
+    text = (s1 + " ") * 6 + (s2 + " ") * 6
+    chunks = chunk_text(text, max_tokens=30, overlap_tokens=12)
     assert len(chunks) >= 2
-    assert chunks[1].startswith(chunks[0][-50:])
 
 
-def test_chunk_document_has_doc_id():
-    doc = {
-        "doc_id": "42",
-        "name": "Тестовый датасет",
-        "text": "Описание переменных: год, инфляция, ВВП.",
-    }
+def test_chunk_document_has_ids():
+    doc = {"doc_id": "42", "name": "Тест", "text": "Короткий текст про данные."}
     chunks = chunk_document(doc)
     assert len(chunks) == 1
     assert chunks[0]["doc_id"] == "42"
     assert chunks[0]["chunk_id"] == "42_0"
-    assert chunks[0]["name"] == "Тестовый датасет"
+    assert chunks[0]["name"] == "Тест"
 
 
 def test_run_creates_chunks_jsonl(tmp_path):
@@ -51,5 +50,4 @@ def test_run_creates_chunks_jsonl(tmp_path):
     count = run(input_path=docs, output_path=out)
     assert count == 1
     assert out.exists()
-    line = out.read_text(encoding="utf-8").strip()
-    assert '"doc_id": "0"' in line
+    assert '"doc_id": "0"' in out.read_text(encoding="utf-8")

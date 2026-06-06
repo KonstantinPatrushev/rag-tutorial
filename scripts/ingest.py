@@ -1,4 +1,8 @@
-"""Ingestion: datasets.json → documents.jsonl."""
+"""Ingestion: datasets.json → documents.jsonl.
+
+Нормализует сырой корпус (datasets.json) в построчный documents.jsonl
+с метаданными (doc_id, name, source_file). Это первый шаг офлайн-пайплайна.
+"""
 
 import json
 import re
